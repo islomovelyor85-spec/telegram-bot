@@ -1,68 +1,120 @@
-import re
+import os
 import asyncio
-from telethon import events, utils
-from db import add_channel_db, remove_channel_db, get_channels_db, search_files_db
-from link_handler import setup_link_handler
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from db import (
+    add_channel_db, remove_channel_db, get_channels_db,
+    set_user_logged_in, is_user_logged_in
+)
+from watcher import send_to_database_and_user
 
+os.makedirs("user_sessions", exist_ok=True)
 
-def setup_control_bot(bot, userbot, admin_ids, db_channel, max_range, history_delay, search_limit=10):
+active_clients = {}
+login_states = {}
+
+async def get_user_client(user_id, api_id, api_hash, fallback_userbot):
+    if user_id in active_clients:
+        client = active_clients[user_id]
+        if not client.is_connected():
+            await client.connect()
+        return client
+    
+    session_path = f"user_sessions/user_{user_id}"
+    if is_user_logged_in(user_id) and os.path.exists(f"{session_path}.session"):
+        client = TelegramClient(session_path, api_id, api_hash)
+        await client.connect()
+        if await client.is_user_authorized():
+            active_clients[user_id] = client
+            return client
+            
+    return fallback_userbot
+
+def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel, max_range, history_delay):
     def is_admin(user_id):
         return user_id in admin_ids
 
-    @bot.on(events.NewMessage(pattern=r"^/start"))
+    @bot.on(events.NewMessage(pattern="/start"))
     async def start_cmd(event):
-        text = (
-            "🤖 **Salom! Bot ishlamoqda.**\n\n"
-            "Menga kanal post havolasini yuboring, men uni sizga tashlab beraman va baza kanalga yig'aman:\n"
-            "• `https://t.me/c/123456/55` — bitta post\n"
-            "• `https://t.me/c/123456/50-60` — oraliq\n"
-            "• `https://t.me/username/55` — ochiq kanal\n\n"
-            "🔐 Yopiq kanal bo'lsa, avval uning **taklif havolasini** yuboring "
-            "(`https://t.me/+...`) — men o'zim qo'shilaman, keyin post havolasini yuborasiz.\n\n"
-            f"🔎 `/search <so'z>` — bazadan qidirish\n\n"
-            "*(Bu botdan hamma foydalana oladi).*"
+        user_id = event.sender_id
+        status = "✅ Akkauntingiz ulangan" if is_user_logged_in(user_id) else "❌ Akkaunt ulanmagan"
+        await event.respond(
+            f"🤖 **Salom! Yopiq kanallardan yuklovchi botga xush kelibsiz.**\n\n"
+            f"Holatingiz: **{status}**\n\n"
+            f"🔒 **Xavfsizlik kafolati:**\n"
+            f"Sizning ma'lumotlaringiz adminga yoki boshqa uchinchi shaxslarga tushmaydi! "
+            f"Kiritgan raqamingiz faqat o'zingizning shaxsiy sessiyangizni yaratish uchun ishlatiladi. "
+            f"Shu orqali faqat **o'zingiz a'zo bo'lgan** yopiq kanallardan fayllarni xavfsiz yuklab ola olasiz.\n\n"
+            "📌 **Qanday ishlaydi?**\n"
+            "1. Avval `/login` buyrug‘i orqali shaxsiy akkauntingizni ulang.\n"
+            "2. Istalgan yopiq kanal post havolasini (masalan: `https://t.me/c/2258587153/13580` yoki `50-65`) yuboring — bot darhol yuklab beradi!\n\n"
+            "**Buyruqlar:**\n"
+            "🔑 `/login` — Shaxsiy akkauntni ulash\n"
+            "🚪 `/logout` — Akkauntni uzish\n"
+            "❌ `/cancel` — Jarayonni bekor qilish"
         )
-        if is_admin(event.sender_id):
-            text += (
-                "\n\n**Admin buyruqlari:**\n"
-                "➕ `/add <kanal_id yoki @username>` - Kanal qo'shish\n"
-                "➖ `/remove <kanal_id>` - Kanalni o'chirish\n"
-                "📋 `/channels` - Kanallar ro'yxati"
-            )
-        await event.respond(text)
 
-    @bot.on(events.NewMessage(pattern=r"^/add\s+(\S+)"))
-    async def add_chan(event):
-        if not is_admin(event.sender_id):
-            await event.respond("❌ Kechirasiz, bu buyruq faqat admin uchun.")
+    @bot.on(events.NewMessage(pattern="/cancel"))
+    async def cancel_cmd(event):
+        user_id = event.sender_id
+        if user_id in login_states:
+            state = login_states.pop(user_id)
+            if "client" in state:
+                await state["client"].disconnect()
+            await event.respond("🚫 Kirish jarayoni bekor qilindi.")
+
+    @bot.on(events.NewMessage(pattern="/logout"))
+    async def logout_cmd(event):
+        user_id = event.sender_id
+        if user_id in active_clients:
+            await active_clients[user_id].log_out()
+            del active_clients[user_id]
+        session_file = f"user_sessions/user_{user_id}.session"
+        if os.path.exists(session_file):
+            os.remove(session_file)
+        set_user_logged_in(user_id, "", status=0)
+        await event.respond("🚪 Akkauntingiz botdan muvaffaqiyatli uzildi va barcha ma'lumotlaringiz o‘chirildi.")
+
+    @bot.on(events.NewMessage(pattern="/login"))
+    async def login_cmd(event):
+        if not event.is_private:
             return
+        user_id = event.sender_id
+        if is_user_logged_in(user_id):
+            await event.respond("✅ Siz allaqachon tizimga kirgansiz! Yangidan ulash uchun avval `/logout` bosing.")
+            return
+        
+        login_states[user_id] = {"step": "phone"}
+        await event.respond(
+            "📱 **Telegram telefon raqamingizni yuboring** (xalqaro formatda, masalan: `+998901234567`):\n\n"
+            "*(Ma'lumotlaringiz mutlaqo xavfsiz. Bekor qilish uchun `/cancel` yozing)*"
+        )
+
+    # Admin buyruqlari
+    @bot.on(events.NewMessage(pattern=r"^/add\s+(-?\d+)"))
+    async def add_chan(event):
+        if not is_admin(event.sender_id): return
         try:
-            arg = event.pattern_match.group(1)
-            target = int(arg) if re.fullmatch(r"-?\d+", arg) else arg
-            chat = await userbot.get_entity(target)
-            peer_id = utils.get_peer_id(chat)  # -100... ko'rinishida, event.chat_id bilan mos
-            title = getattr(chat, "title", None) or getattr(chat, "first_name", "") or str(peer_id)
-            add_channel_db(peer_id, title)
-            await event.respond(f"✅ Kanal qo'shildi: **{title}** (`{peer_id}`)")
+            chat_id = int(event.pattern_match.group(1))
+            chat = await main_userbot.get_entity(chat_id)
+            add_channel_db(chat.id, chat.title)
+            await event.respond(f"✅ Kanal qo'shildi: **{chat.title}** (`{chat.id}`)")
         except Exception as e:
-            await event.respond(f"❌ Xatolik: {e}\n\nUserbot akkaunti shu kanal a'zosi ekanini tekshiring.")
+            await event.respond(f"❌ Xatolik: {e}")
 
     @bot.on(events.NewMessage(pattern=r"^/remove\s+(-?\d+)"))
     async def remove_chan(event):
-        if not is_admin(event.sender_id):
-            await event.respond("❌ Kechirasiz, bu buyruq faqat admin uchun.")
-            return
-        chat_id = int(event.pattern_match.group(1))
-        if remove_channel_db(chat_id):
+        if not is_admin(event.sender_id): return
+        try:
+            chat_id = int(event.pattern_match.group(1))
+            remove_channel_db(chat_id)
             await event.respond(f"🗑 Kanal o'chirildi: `{chat_id}`")
-        else:
-            await event.respond(f"⚠️ `{chat_id}` ro'yxatda topilmadi. `/channels` dan aniq ID ni oling.")
+        except Exception as e:
+            await event.respond(f"❌ Xatolik: {e}")
 
-    @bot.on(events.NewMessage(pattern=r"^/channels"))
+    @bot.on(events.NewMessage(pattern="/channels"))
     async def list_chans(event):
-        if not is_admin(event.sender_id):
-            await event.respond("❌ Kechirasiz, bu buyruq faqat admin uchun.")
-            return
+        if not is_admin(event.sender_id): return
         rows = get_channels_db()
         if not rows:
             await event.respond("📭 Hozircha kuzatilayotgan kanallar yo'q.")
@@ -72,29 +124,140 @@ def setup_control_bot(bot, userbot, admin_ids, db_channel, max_range, history_de
             text += f"▪️ {title or 'Noma’lum'} (`{cid}`)\n"
         await event.respond(text)
 
-    @bot.on(events.NewMessage(pattern=r"^/search(?:\s+(.+))?"))
-    async def search_cmd(event):
-        query = (event.pattern_match.group(1) or "").strip()
-        if not query:
-            await event.respond("🔎 Foydalanish: `/search <so'z>`")
-            return
-        rows = search_files_db(query, search_limit)
-        if not rows:
-            await event.respond("😕 Hech narsa topilmadi.")
-            return
-        await event.respond(f"🔎 {len(rows)} ta natija topildi, yuborilmoqda...")
-        for _name, msg_id, chan_id in rows:
-            try:
-                m = await bot.get_messages(chan_id, ids=msg_id)
-                if not m:
-                    continue
-                if m.media:
-                    await bot.send_file(event.chat_id, m.media)
-                elif m.text:
-                    await bot.send_message(event.chat_id, m.text.split("\n\n---\n")[0])
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                print(f"Qidiruv yuborish xatosi: {e!r}")
+    # Login va link qismi
+    @bot.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith("/")))
+    async def message_handler(event):
+        user_id = event.sender_id
+        text = event.text.strip()
 
-    # Havolalar (taklif linki va post havolalari)
-    setup_link_handler(bot, userbot, db_channel, max_range, history_delay)
+        if user_id in login_states:
+            state = login_states[user_id]
+            step = state["step"]
+
+            if step == "phone":
+                phone = text.replace(" ", "")
+                session_path = f"user_sessions/user_{user_id}"
+                client = TelegramClient(session_path, api_id, api_hash)
+                await client.connect()
+                try:
+                    sent_code = await client.send_code_request(phone)
+                    state["client"] = client
+                    state["phone"] = phone
+                    state["phone_code_hash"] = sent_code.phone_code_hash
+                    state["step"] = "code"
+                    await event.respond(
+                        "📩 Telegramingizga **5 xonali kod** yuborildi.\n"
+                        "⚠️ **Diqqat:** Kodni xavfsizlik uchun orasiga probel yoki nuqta qo‘yib yuboring (masalan: `1 2 3 4 5`), aks holda Telegram bloklab qo‘yishi mumkin!"
+                    )
+                except Exception as e:
+                    await client.disconnect()
+                    del login_states[user_id]
+                    await event.respond(f"❌ Xatolik: {e}\nQaytadan `/login` bosib urinib ko‘ring.")
+                return
+
+            elif step == "code":
+                code = text.replace(" ", "").replace(".", "").replace("-", "")
+                client = state["client"]
+                try:
+                    await client.sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
+                    set_user_logged_in(user_id, state["phone"], status=1)
+                    active_clients[user_id] = client
+                    del login_states[user_id]
+                    await event.respond("🎉 **Tabriklaymiz! Akkauntingiz muvaffaqiyatli ulandi.**\nEndi o‘zingiz a'zo bo‘lgan yopiq kanallardan post havolasini yuborishingiz mumkin!")
+                except SessionPasswordNeededError:
+                    state["step"] = "password"
+                    await event.respond("🔐 Akkauntingizda **Ikki bosqichli parol (2FA)** o‘rnatilgan ekan. Parolingizni kiriting:")
+                except PhoneCodeInvalidError:
+                    await event.respond("❌ Kod noto‘g‘ri kiritildi. Qaytadan kiriting:")
+                except Exception as e:
+                    await client.disconnect()
+                    del login_states[user_id]
+                    await event.respond(f"❌ Xatolik: {e}")
+                return
+
+            elif step == "password":
+                client = state["client"]
+                try:
+                    await client.sign_in(password=text)
+                    set_user_logged_in(user_id, state["phone"], status=1)
+                    active_clients[user_id] = client
+                    del login_states[user_id]
+                    await event.respond("🎉 **Tabriklaymiz! Akkauntingiz muvaffaqiyatli ulandi.**\nEndi yopiq kanallardan post havolasini yuborishingiz mumkin!")
+                except Exception as e:
+                    await event.respond(f"❌ Parol noto‘g‘ri yoki xatolik: {e}\nQaytadan urinib ko‘ring yoki `/cancel` bosing.")
+                return
+
+        if "t.me/" in text:
+            client = await get_user_client(user_id, api_id, api_hash, main_userbot)
+
+            try:
+                if "-" in text.split("/")[-1] and not text.endswith("/"):
+                    base_url, range_part = text.rsplit("/", 1)
+                    start_str, end_str = range_part.split("-")
+                    start_id = int(start_str)
+                    end_id = int(end_str)
+
+                    if (end_id - start_id) > max_range:
+                        await event.respond(f"⚠️ Bir martada ko'pi bilan {max_range} ta xabar olishingiz mumkin.")
+                        return
+
+                    await event.respond(f"⏳ {start_id} dan {end_id} gacha xabarlar yuklanmoqda...")
+
+                    if "/c/" in base_url:
+                        parts = base_url.split("/c/")
+                        sub_parts = parts[1].split("/")
+                        chat_id = int("-100" + sub_parts[0])
+                    else:
+                        parts = base_url.split("t.me/")
+                        sub_parts = parts[1].split("/")
+                        username = sub_parts[0]
+                        chat_entity = await client.get_entity(username)
+                        chat_id = chat_entity.id
+
+                    try:
+                        chat_entity = await client.get_entity(chat_id)
+                    except Exception:
+                        await event.respond("❌ Kanal topilmadi. Agar bu yopiq kanal bo‘lsa, avval `/login` orqali o‘sha kanalga a'zo bo‘lgan akkauntingizni ulang.")
+                        return
+
+                    success_count = 0
+                    for msg_id in range(start_id, end_id + 1):
+                        try:
+                            msg = await client.get_messages(chat_entity, ids=msg_id)
+                            if msg and (msg.media or msg.document or msg.photo or msg.text):
+                                await send_to_database_and_user(client, bot, db_channel, msg, target_user_event=event, original_link=f"{base_url}/{msg_id}")
+                                success_count += 1
+                                await asyncio.sleep(history_delay)
+                        except Exception:
+                            continue
+
+                    await event.respond(f"✅ Yakunlandi! Jami {success_count} ta xabar yuklandi va bazaga saqlandi.")
+                    return
+
+                if "/c/" in text:
+                    parts = text.split("/c/")
+                    sub_parts = parts[1].split("/")
+                    chat_id = int("-100" + sub_parts[0])
+                    msg_id = int(sub_parts[1].split("-")[0])
+                else:
+                    parts = text.split("t.me/")
+                    sub_parts = parts[1].split("/")
+                    username = sub_parts[0]
+                    msg_id = int(sub_parts[1].split("-")[0])
+                    chat_entity = await client.get_entity(username)
+                    chat_id = chat_entity.id
+
+                try:
+                    chat_entity = await client.get_entity(chat_id)
+                except Exception:
+                    await event.respond("❌ Kanal topilmadi. Agar bu yopiq kanal bo‘lsa, avval `/login` orqali o‘sha kanalga a'zo bo‘lgan akkauntingizni ulang.")
+                    return
+
+                msg = await client.get_messages(chat_entity, ids=msg_id)
+                if msg:
+                    await send_to_database_and_user(client, bot, db_channel, msg, target_user_event=event, original_link=text)
+                    await event.respond("✅ Muvaffaqiyatli yuklandi va bazaga saqlandi!")
+                else:
+                    await event.respond("❌ Xabar topilmadi.")
+            except Exception as e:
+                await event.respond(f"❌ Xatolik yuz berdi: {e}")
