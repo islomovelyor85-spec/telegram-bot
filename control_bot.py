@@ -67,7 +67,10 @@ def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel
     async def logout_cmd(event):
         user_id = event.sender_id
         if user_id in active_clients:
-            await active_clients[user_id].log_out()
+            try:
+                await active_clients[user_id].log_out()
+            except Exception:
+                pass
             del active_clients[user_id]
         session_file = f"user_sessions/user_{user_id}.session"
         if os.path.exists(session_file):
@@ -90,7 +93,6 @@ def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel
             "*(Ma'lumotlaringiz mutlaqo xavfsiz. Bekor qilish uchun `/cancel` yozing)*"
         )
 
-    # Admin buyruqlari
     @bot.on(events.NewMessage(pattern=r"^/add\s+(-?\d+)"))
     async def add_chan(event):
         if not is_admin(event.sender_id): return
@@ -124,7 +126,6 @@ def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel
             text += f"▪️ {title or 'Noma’lum'} (`{cid}`)\n"
         await event.respond(text)
 
-    # Login va link qismi
     @bot.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith("/")))
     async def message_handler(event):
         user_id = event.sender_id
@@ -147,7 +148,7 @@ def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel
                     state["step"] = "code"
                     await event.respond(
                         "📩 Telegramingizga **5 xonali kod** yuborildi.\n"
-                        "⚠️ **Diqqat:** Kodni xavfsizlik uchun orasiga probel yoki nuqta qo‘yib yuboring (masalan: `1 2 3 4 5`), aks holda Telegram bloklab qo‘yishi mumkin!"
+                        "⚠️ **Diqqat:** Kodni xavfsizlik uchun orasiga probel yoki nuqta qo‘yib yuboring (masalan: `1 2 3 4 5`)."
                     )
                 except Exception as e:
                     await client.disconnect()
@@ -163,7 +164,7 @@ def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel
                     set_user_logged_in(user_id, state["phone"], status=1)
                     active_clients[user_id] = client
                     del login_states[user_id]
-                    await event.respond("🎉 **Tabriklaymiz! Akkauntingiz muvaffaqiyatli ulandi.**\nEndi o‘zingiz a'zo bo‘lgan yopiq kanallardan post havolasini yuborishingiz mumkin!")
+                    await event.respond("🎉 **Tabriklaymiz! Akkauntingiz muvaffaqiyatli ulandi.**\nEndi yopiq kanallardan post havolasini yuborishingiz mumkin!")
                 except SessionPasswordNeededError:
                     state["step"] = "password"
                     await event.respond("🔐 Akkauntingizda **Ikki bosqichli parol (2FA)** o‘rnatilgan ekan. Parolingizni kiriting:")
