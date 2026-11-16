@@ -7,9 +7,3 @@ __pycache__/
 userbot_session.txt
 user_sessions/
 data.tar.gz.enc
-.env
-*.session
-*.session-journal
-bot_database.db
-venv/
-__pycache__/
