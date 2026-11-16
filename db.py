@@ -27,6 +27,14 @@ CREATE TABLE IF NOT EXISTS users (
     status INTEGER DEFAULT 0
 )
 """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bot_users (
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT,
+    username TEXT,
+    blocked INTEGER DEFAULT 0
+)
+""")
 conn.commit()
 
 watched_chats_cache = set()
@@ -89,3 +97,24 @@ def is_user_logged_in(user_id):
     cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     return bool(row and row[0] == 1)
+
+
+def save_bot_user(user_id, first_name, username):
+    """Botga yozgan har bir odamni saqlaydi (broadcast uchun)."""
+    cursor.execute(
+        """INSERT INTO bot_users (user_id, first_name, username, blocked) VALUES (?, ?, ?, 0)
+           ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name,
+           username = excluded.username, blocked = 0""",
+        (user_id, first_name, username)
+    )
+    conn.commit()
+
+
+def get_bot_users():
+    cursor.execute("SELECT user_id FROM bot_users WHERE blocked = 0")
+    return [row[0] for row in cursor.fetchall()]
+
+
+def mark_bot_user_blocked(user_id):
+    cursor.execute("UPDATE bot_users SET blocked = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
