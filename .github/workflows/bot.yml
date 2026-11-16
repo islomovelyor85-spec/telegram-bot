@@ -1,0 +1,73 @@
+name: Telegram bot
+
+on:
+  workflow_dispatch:        # qo'lda ishga tushirish (Actions -> Run workflow)
+  push:
+    branches: [main]        # kod o'zgarsa, bot yangi kod bilan qayta ishga tushadi
+  schedule:
+    - cron: "*/30 * * * *"  # zaxira: bot to'xtagan bo'lsa, 30 daqiqa ichida qayta yoqadi
+
+# Bir vaqtda faqat bitta bot ishlaydi. Yangi kod (push) eskisini to'xtatadi,
+# jadvaldagi ishga tushish esa navbatda kutib turadi.
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Baza va foydalanuvchilar sessiyalari ishga tushishlar orasida saqlanadi.
+      # Repo ochiq, shuning uchun ular BOT_TOKEN bilan shifrlanadi.
+      - name: Ma'lumotlarni tiklash
+        uses: actions/cache/restore@v4
+        with:
+          path: data.tar.gz.enc
+          key: botdata-${{ github.run_id }}
+          restore-keys: botdata-
+
+      - name: Ma'lumotlarni ochish
+        env:
+          DATA_KEY: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -f data.tar.gz.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:DATA_KEY -in data.tar.gz.enc | tar xzf -
+            rm data.tar.gz.enc
+          fi
+
+      - name: Botni ishga tushirish
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DB_CHANNEL: ${{ secrets.DB_CHANNEL }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          USERBOT_SESSION: ${{ secrets.USERBOT_SESSION }}
+          RUN_HOURS: "5.8"
+        run: python -u main.py
+
+      - name: Ma'lumotlarni shifrlash
+        if: always()
+        env:
+          DATA_KEY: ${{ secrets.BOT_TOKEN }}
+        run: |
+          mkdir -p user_sessions
+          touch bot_database.db
+          tar czf - bot_database.db user_sessions | openssl enc -aes-256-cbc -pbkdf2 -pass env:DATA_KEY -out data.tar.gz.enc
+
+      - name: Ma'lumotlarni saqlash
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data.tar.gz.enc
+          key: botdata-${{ github.run_id }}-${{ github.run_attempt }}
