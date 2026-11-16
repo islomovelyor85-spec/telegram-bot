@@ -1,10 +1,14 @@
 import os
 import asyncio
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError,
+    UserIsBlockedError, InputUserDeactivatedError, PeerIdInvalidError
+)
 from db import (
     add_channel_db, remove_channel_db, get_channels_db,
-    set_user_logged_in, is_user_logged_in
+    set_user_logged_in, is_user_logged_in,
+    save_bot_user, get_bot_users, mark_bot_user_blocked
 )
 from watcher import send_to_database_and_user
 
@@ -33,6 +37,60 @@ async def get_user_client(user_id, api_id, api_hash, fallback_userbot):
 def setup_control_bot(bot, main_userbot, api_id, api_hash, admin_ids, db_channel, max_range, history_delay):
     def is_admin(user_id):
         return user_id in admin_ids
+
+    # Botga shaxsiy yozgan har bir odamni saqlaymiz (broadcast uchun)
+    @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    async def remember_user(event):
+        try:
+            sender = await event.get_sender()
+            save_bot_user(event.sender_id, getattr(sender, "first_name", None), getattr(sender, "username", None))
+        except Exception as e:
+            print(f"⚠️ Foydalanuvchini saqlab bo'lmadi: {e}")
+
+    @bot.on(events.NewMessage(pattern=r"^/broadcast(?:\s+([\s\S]+))?$"))
+    async def broadcast_cmd(event):
+        if not is_admin(event.sender_id):
+            return
+        reply = await event.get_reply_message()
+        text = event.pattern_match.group(1)
+        if not reply and not text:
+            await event.respond(
+                "📣 **Hammaga xabar yuborish:**\n"
+                "• Yubormoqchi bo'lgan xabarga **javob (reply)** qilib `/broadcast` yozing, yoki\n"
+                "• `/broadcast matn` deb yozing."
+            )
+            return
+
+        users = get_bot_users()
+        status = await event.respond(f"⏳ {len(users)} ta foydalanuvchiga yuborilmoqda...")
+        sent = failed = 0
+        for uid in users:
+            try:
+                if reply:
+                    await bot.send_message(uid, reply)
+                else:
+                    await bot.send_message(uid, text)
+                sent += 1
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+                try:
+                    await bot.send_message(uid, reply or text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            except (UserIsBlockedError, InputUserDeactivatedError, PeerIdInvalidError):
+                mark_bot_user_blocked(uid)
+                failed += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.1)  # Telegram cheklovidan oshmaslik uchun (~10 ta/soniya)
+        await status.edit(f"✅ Yuborildi: {sent} ta\n❌ Yetib bormadi: {failed} ta (botni bloklagan yoki o'chirilgan)")
+
+    @bot.on(events.NewMessage(pattern="/users"))
+    async def users_cmd(event):
+        if not is_admin(event.sender_id):
+            return
+        await event.respond(f"👥 Botdan foydalanuvchilar: **{len(get_bot_users())}** ta")
 
     @bot.on(events.NewMessage(pattern="/start"))
     async def start_cmd(event):
