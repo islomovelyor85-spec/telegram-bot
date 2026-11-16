@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS files (
     channel_id INTEGER
 )
 """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    phone TEXT,
+    status INTEGER DEFAULT 0
+)
+""")
 conn.commit()
 
 watched_chats_cache = set()
@@ -68,3 +75,17 @@ def search_files_db(query, limit=10):
         (f"%{query}%", limit)
     )
     return cursor.fetchall()
+
+
+def set_user_logged_in(user_id, phone, status=1):
+    cursor.execute(
+        "INSERT OR REPLACE INTO users (user_id, phone, status) VALUES (?, ?, ?)",
+        (user_id, phone, status)
+    )
+    conn.commit()
+
+
+def is_user_logged_in(user_id):
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    return bool(row and row[0] == 1)
